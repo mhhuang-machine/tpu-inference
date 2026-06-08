@@ -787,6 +787,7 @@ class KVCacheManager:
                             # conv_state: [num_blocks, conv_kernel_size, intermediate_size]
                             spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
                                                  None,
+                                                 None,
                                                  ShardingAxisName.ATTN_HEAD)
                         elif state_index == 1:
                             # ssm_state: [num_blocks, num_heads, head_dim, state_size]

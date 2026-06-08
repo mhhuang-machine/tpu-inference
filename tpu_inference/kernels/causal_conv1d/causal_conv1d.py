@@ -32,10 +32,17 @@ class ConvConfigs:
     dim_size: int
     kernel_size: int
     tile_size: int
+    packing: int
 
     @property
     def prev_kernel_size(self) -> int:
         return self.kernel_size - 1
+
+    @property
+    def packed_rows(self) -> int:
+        # Use self.kernel_size instead of self.prev_kernel_size
+        # This reserves one more slot so we can shift left by 1 later.
+        return pl.cdiv(self.kernel_size, self.packing)
 
 
 @jax.tree_util.register_dataclass
@@ -139,6 +146,8 @@ class XBuffer(BufferWrapper):
 class ConvStateBuffer(BufferWrapper):
 
     def copy_in(self, b_start, slot, sem):
+        packing = self.cfgs.packing
+
         is_no_op = self.is_upper_oob(b_start)
         b_start = jnp.where(is_no_op, 0, b_start)
 
@@ -148,21 +157,31 @@ class ConvStateBuffer(BufferWrapper):
             state_idx = self.metadata_ref.s_idx_to_state_idx[s_idx]
             sz_from_old = self.metadata_ref.b_idx_to_sz_from_old[b_idx]
             start_from_old = self.cfgs.prev_kernel_size - sz_from_old
-            sz_from_old = jnp.where(is_no_op, 0, sz_from_old)
+
+            packed_start = start_from_old // packing
+            packed_end = pl.cdiv(self.cfgs.prev_kernel_size, packing)
+            packed_sz = packed_end - packed_start
+            packed_sz = jnp.where(is_no_op, 0, packed_sz)
 
             pltpu.make_async_copy(
                 self.hbm_ref.at[state_idx,
-                                pl.ds(start_from_old, sz_from_old)],
-                self.get_slot_vmem(slot).at[idx, pl.ds(0, sz_from_old)],
+                                pl.ds(packed_start, packed_sz)],
+                self.get_slot_vmem(slot).at[idx, pl.ds(0, packed_sz)],
                 sem,
             ).start()
 
     def wait_in(self, b_start, slot, sem):
         all_sz_from_old = 0
+        packing = self.cfgs.packing
         for idx in range(self.cfgs.tile_size):
             b_idx = b_start + idx
-            all_sz_from_old += self.metadata_ref.b_idx_to_sz_from_old[b_idx]
+            sz_from_old = self.metadata_ref.b_idx_to_sz_from_old[b_idx]
+            start_from_old = self.cfgs.prev_kernel_size - sz_from_old
 
+            packed_start = start_from_old // packing
+            packed_end = pl.cdiv(self.cfgs.prev_kernel_size, packing)
+            packed_sz = packed_end - packed_start
+            all_sz_from_old += packed_sz
         pltpu.make_async_copy(
             self.vmem_ref.at[0, 0, pl.ds(0, all_sz_from_old)],
             self.vmem_ref.at[0, 0, pl.ds(0, all_sz_from_old)],
@@ -170,6 +189,7 @@ class ConvStateBuffer(BufferWrapper):
         ).wait()
 
     def copy_out(self, b_start, slot, sem):
+        sz = self.hbm_ref.shape[1]
         for idx in range(self.cfgs.tile_size):
             b_idx = b_start + idx
             s_idx = self.metadata_ref.b_idx_to_s_idx[b_idx]
@@ -177,8 +197,8 @@ class ConvStateBuffer(BufferWrapper):
             should_write = self.metadata_ref.b_idx_should_write[b_idx]
 
             pltpu.make_async_copy(
-                self.get_slot_vmem(slot).at[pl.ds(idx, should_write)],
-                self.hbm_ref.at[pl.ds(state_idx, should_write)],
+                self.get_slot_vmem(slot).at[pl.ds(idx, should_write), pl.ds(0, sz)],
+                self.hbm_ref.at[pl.ds(state_idx, should_write), pl.ds(0, sz)],
                 sem,
             ).start()
 
@@ -187,14 +207,15 @@ class ConvStateBuffer(BufferWrapper):
         b_start = jnp.where(is_no_op, 0, b_start)
 
         all_writes = 0
+        sz = self.hbm_ref.shape[1]
         for idx in range(self.cfgs.tile_size):
             b_idx = b_start + idx
             all_writes += self.metadata_ref.b_idx_should_write[b_idx]
 
         all_writes = jnp.where(is_no_op, 0, all_writes)
         pltpu.make_async_copy(
-            self.vmem_ref.at[0, pl.ds(0, all_writes)],
-            self.vmem_ref.at[0, pl.ds(0, all_writes)],
+            self.vmem_ref.at[0, pl.ds(0, all_writes), pl.ds(0, sz)],
+            self.vmem_ref.at[0, pl.ds(0, all_writes), pl.ds(0, sz)],
             sem,
         ).wait()
 
@@ -273,8 +294,24 @@ def inner_kernel(
         sz_from_old = metadata_ref.b_idx_to_sz_from_old[b_idx]
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
+        start_from_old = cfgs.prev_kernel_size - sz_from_old
+
         out = jnp.zeros((1, cfgs.dim_size), jnp.float32)
 
+        reshaped_conv_state_slot_ref = conv_state_slot_ref.reshape(
+            conv_state_slot_ref.shape[0], -1, conv_state_slot_ref.shape[-1]
+        )
+        old_conv_state = strided_ldst.load_large_to_compact(
+            reshaped_conv_state_slot_ref.at[idx], dst_dtype=jnp.float32
+        )
+        old_conv_state_offset0 = old_conv_state[:-1]
+        old_conv_state_offset1 = old_conv_state[1:]
+        old_conv_state = jnp.where(
+            (cfgs.packing == 1) or (start_from_old % 2 == 0),
+            old_conv_state_offset0,
+            old_conv_state_offset1,
+        )
+        new_conv_state = []
         for k in range(cfgs.kernel_size):
             # Computation for out[row] requires reading data
             # x[row - (kernel_size - 1) + k] where k iterates from 0 to
@@ -286,15 +323,23 @@ def inner_kernel(
             lhs = x_compact[in_idx]
 
             if k < cfgs.prev_kernel_size:
-                conv_state = conv_state_slot_ref[idx, k]
+                conv_state = old_conv_state[k]
                 conv_state = jnp.where(has_initial_state, conv_state, 0)
                 lhs = jnp.where(k < sz_from_old, conv_state, lhs)
 
             if k > 0:
-                conv_state_slot_ref[idx, k - 1] = lhs
+                new_conv_state.append(lhs)
 
             rhs = conv_rhs_ref.weight[k]
             out += lhs * rhs
+
+        for _ in range(cfgs.kernel_size - 1, reshaped_conv_state_slot_ref.shape[1]):
+            new_conv_state.append(jnp.zeros_like(new_conv_state[0]))
+
+        strided_ldst.store_compact_to_large(
+            reshaped_conv_state_slot_ref.at[idx],
+            jnp.stack(new_conv_state, axis=0),
+        )
 
         if conv_rhs_ref.bias is not None:
             bias = conv_rhs_ref.bias[...].reshape(1, -1)
@@ -393,8 +438,7 @@ def preprocess_metadata(
     # Mask out padded locations.
     num_tokens = query_start_loc[num_seqs]
     all_seqs = jnp.arange(max_seqs + 1)
-    query_start_loc = jnp.where(all_seqs <= num_seqs, query_start_loc,
-                                num_tokens)
+    query_start_loc = jnp.where(all_seqs <= num_seqs, query_start_loc, num_tokens)
 
     # Map batch index to sequence index.
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
@@ -433,7 +477,8 @@ def preprocess_metadata(
 )
 def ragged_causal_conv1d(
     x: jax.Array,  # (batch_size, dim_size)
-    conv_state: jax.Array,  # (max_num_seqs, kernel_size - 1, dim_size)
+    # (max_num_seqs, cdiv(kernel_size, packing), packing, dim_size)
+    conv_state: jax.Array,
     conv_weight: jax.Array,  # (dim_size, 1, kernel_size)
     conv_bias: jax.Array | None,  # (kernel_size,)
     query_start_loc: jax.Array,  # (max_num_seqs + 1,)
@@ -487,9 +532,14 @@ def ragged_causal_conv1d(
     # TODO(kyuyeunk): Perform this during model loading to eliminate runtime cost.
     conv_state_shape = conv_state.shape
     conv_state_dtype = conv_state.dtype
-    # TODO(mhhuang): Remove the need for upcast.
-    conv_state = conv_state.astype(jnp.float32)
-    conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+    assert conv_state_dtype in [jnp.float32, jnp.bfloat16]
+    packing = 4 // jnp.dtype(conv_state_dtype).itemsize
+    assert conv_state.shape == (
+        num_seqs + 1,
+        (kernel_size + packing - 1) // packing,
+        packing,
+        dim,
+    )
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
         jnp.float32) if conv_bias is not None else None
@@ -499,6 +549,7 @@ def ragged_causal_conv1d(
         kernel_size=kernel_size,
         tile_size=tile_size,
         dim_size=dim,
+        packing=packing,
     )
 
     # Step 4: Metadata preprocessing.
@@ -529,8 +580,14 @@ def ragged_causal_conv1d(
         scratch_shapes=(
             pltpu.VMEM((2, cfgs.tile_size, cfgs.dim_size), x_dtype),
             pltpu.VMEM(
-                (2, cfgs.tile_size, cfgs.prev_kernel_size, 1, cfgs.dim_size),
-                jnp.float32,
+                (
+                    2,
+                    cfgs.tile_size,
+                    cfgs.packed_rows,
+                    cfgs.packing,
+                    cfgs.dim_size,
+                ),
+                conv_state_dtype,
             ),
             pltpu.VMEM((cfgs.prev_kernel_size, 1, cfgs.dim_size), jnp.float32),
             pltpu.SemaphoreType.DMA((2, )),
