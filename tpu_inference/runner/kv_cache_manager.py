@@ -796,9 +796,9 @@ class KVCacheManager:
                         jax_dtype = t2j_dtype(dtype)
                         if state_index == 0:
                             # TODO set packing
-                            # shape = _get_mamba_conv_cache_shape(layer_spec, 2)
-                            # conv_state: [num_blocks, num_rows, packing, head_dim]
+                            shape = _get_mamba_conv_cache_shape(layer_spec, 2)
                             cache_shape = (mamba_num_blocks, *shape)
+                            # conv_state: [num_blocks, num_rows, packing, head_dim]
                             spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
                                                  None,
                                                  None,
