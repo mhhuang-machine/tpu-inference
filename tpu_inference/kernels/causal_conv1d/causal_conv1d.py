@@ -601,7 +601,5 @@ def ragged_causal_conv1d(
 
     # Step 8: Output post-processing.
     out = out[:batch_size]
-    new_conv_state = new_conv_state.astype(conv_state_dtype)
-    new_conv_state = new_conv_state.reshape(conv_state_shape)
 
     return out, new_conv_state

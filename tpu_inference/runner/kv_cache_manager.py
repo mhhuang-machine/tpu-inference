@@ -53,6 +53,18 @@ logger = init_logger(__name__)
 # N=num_blocks, H=num_heads and D=head_size
 DEFAULT_KV_CACHE_LAYOUT = "NHD"
 
+def _get_mamba_conv_cache_shape(
+        layer_spec: MambaSpec,
+        packing: int = 1) -> tuple[int, ...]:
+    """Returns the TPU conv-state shape as [conv_len, cdiv(kernel_size, packing), packing, dim]."""
+    conv_shape = tuple(layer_spec.shapes[0])
+    if len(conv_shape) != 2 or len(layer_spec.shapes) < 2:
+        return conv_shape
+
+    kernel_sz_minus_1, dim = conv_shape
+    num_rows = kernel_sz_minus_1 // packing + 1
+
+    return (num_rows, packing, dim)
 
 class KVCacheManager:
 
@@ -782,19 +794,23 @@ class KVCacheManager:
                     for state_index, (shape, dtype) in enumerate(
                             zip(layer_spec.shapes, layer_spec.dtypes)):
                         jax_dtype = t2j_dtype(dtype)
-                        cache_shape = (mamba_num_blocks, *shape)
                         if state_index == 0:
-                            # conv_state: [num_blocks, conv_kernel_size, intermediate_size]
+                            # TODO set packing
+                            # shape = _get_mamba_conv_cache_shape(layer_spec, 2)
+                            # conv_state: [num_blocks, num_rows, packing, head_dim]
+                            cache_shape = (mamba_num_blocks, *shape)
                             spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
                                                  None,
                                                  None,
                                                  ShardingAxisName.ATTN_HEAD)
                         elif state_index == 1:
+                            cache_shape = (mamba_num_blocks, *shape)
                             # ssm_state: [num_blocks, num_heads, head_dim, state_size]
                             spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
                                                  ShardingAxisName.ATTN_HEAD,
                                                  None, None)
                         else:
+                            cache_shape = (mamba_num_blocks, *shape)
                             spec = PartitionSpec(
                                 None, *([None] * (len(cache_shape) - 1)))
 
