@@ -571,6 +571,7 @@ def ragged_causal_conv1d(
     conv_rhs_spec = jax.tree.map(lambda _: vmem_spec, conv_rhs)
 
     # Step 7: Perform computation.
+    conv_state = pltpu.with_memory_space_constraint(conv_state, pltpu.HBM)
     out, new_conv_state = pl.pallas_call(
         functools.partial(main_kernel, cfgs=cfgs),
         out_shape=(x, conv_state),
