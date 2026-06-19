@@ -99,11 +99,14 @@ def gdn_attention_core_tpu(
 
     layer_idx = vllm_context.layer_name_to_kvcache_index[layer_name]
     conv_state, recurrent_state = vllm_context.kv_caches[layer_idx]
-    state_len = conv_state.shape[1]
-    if state_len > kernel_size - 1:
-        conv_state_in = conv_state[:, :kernel_size - 1, :]
-    else:
-        conv_state_in = conv_state
+
+    conv_state_in = conv_state
+    # should be okay to pass in more tokens
+    # state_len = conv_state.shape[1]
+    # if state_len > kernel_size - 1:
+    #     conv_state_in = conv_state[:, :kernel_size - 1, :]
+    # else:
+    #     conv_state_in = conv_state
 
     # Index mamba state by the per-request slot id from
     # `InputBatch.mamba_state_indices_cpu`, not by `block_tables[:, 0]`
@@ -159,10 +162,18 @@ def gdn_attention_core_tpu(
          kernel_size,
          mesh=mesh,
          config=config)
-    if state_len > kernel_size - 1:
-        remaining_old_state = conv_state[:, kernel_size - 1:, :]
+    # if state_len > kernel_size - 1:
+    #     remaining_old_state = conv_state[:, kernel_size - 1:, :]
+    #     new_conv_state = jnp.concatenate(
+    #         [new_conv_state_extracted, remaining_old_state], axis=1)
+    if layer_module.speculative_config:
+        seq, num_rows, pack_size, head_dim = conv_state.shape
+        flat_conv_state = conv_state.reshape(seq, num_rows * pack_size, head_dim)
+        remaining_old_state = flat_conv_state[:, kernel_size - 1:, :]
+        flat_new_extracted = new_conv_state_extracted.reshape(seq, -1, head_dim)
         new_conv_state = jnp.concatenate(
-            [new_conv_state_extracted, remaining_old_state], axis=1)
+            [flat_new_extracted, remaining_old_state], axis=1
+        ).reshape(seq, num_rows, pack_size, head_dim)
     else:
         new_conv_state = new_conv_state_extracted
 

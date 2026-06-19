@@ -66,6 +66,20 @@ def _get_mamba_conv_cache_shape(
 
     return (num_rows, packing, dim)
 
+
+def _update_conv_shape_in_mamba_spec(
+    mamba_spec: MambaSpec,
+    packing: int = 1) -> MambaSpec:
+    new_conv_shape = _get_mamba_conv_cache_shape(mamba_spec, packing)
+    new_shapes = list(mamba_spec.shapes)
+    new_shapes[0] = new_conv_shape
+    return dataclasses.replace(
+        mamba_spec,
+        shapes=tuple(new_shapes),
+        page_size_padded=None,
+    )
+
+
 class KVCacheManager:
 
     def __init__(self, runner: "TPUModelRunner"):
@@ -219,8 +233,8 @@ class KVCacheManager:
         first_mamba_spec = mamba_modules[0].get_kv_cache_spec(
             self.runner.vllm_config)
         assert isinstance(first_mamba_spec, MambaSpec)
-        unpadded_mamba_page_size = dataclasses.replace(
-            first_mamba_spec, page_size_padded=None).page_size_bytes
+        updated_mamba_spec =  _update_conv_shape_in_mamba_spec(first_mamba_spec, 2)
+        unpadded_mamba_page_size = updated_mamba_spec.page_size_bytes
 
         # Derive vLLM's kv-cache group layout. vLLM splits each type into
         # equal-sized groups of `group_size` layers, then allocates
