@@ -187,9 +187,13 @@ class ConvStateBuffer(BufferWrapper):
             state_idx = self.metadata_ref.s_idx_to_state_idx[s_idx]
             should_write = self.metadata_ref.b_idx_should_write[b_idx]
 
+            rows_to_write = jnp.where(
+                should_write, self.cfgs.padded_kernel_sz_minus_1, 0
+            )
+
             pltpu.make_async_copy(
-                self.get_slot_vmem(slot).at[pl.ds(idx, should_write)],
-                self.hbm_ref.at[pl.ds(state_idx, should_write)],
+                self.get_slot_vmem(slot).at[idx, pl.ds(0, rows_to_write)],
+                self.hbm_ref.at[state_idx, pl.ds(0, rows_to_write)],
                 sem,
             ).start()
 
@@ -544,7 +548,17 @@ def ragged_causal_conv1d(
     conv_state_shape = conv_state.shape
     conv_state_dtype = conv_state.dtype
     assert conv_state_dtype in [jnp.float32, jnp.bfloat16]
-    padded_kernel_sz_minus_1 = conv_state_shape[1]
+    kernel_sz_minus_1 = conv_state_shape[1]
+
+    # Calculate layout tile size and pad to multiple of tile size.
+    item_size = jnp.dtype(conv_state_dtype).itemsize
+    min_tiling = 4 // item_size
+    max_tiling = 8 * min_tiling
+    packing = min_tiling
+    while packing < min(kernel_sz_minus_1, max_tiling):
+      packing *= 2
+
+    padded_kernel_sz_minus_1 = pl.cdiv(kernel_size - 1, packing) * packing
 
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
