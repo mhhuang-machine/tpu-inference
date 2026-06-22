@@ -38,6 +38,9 @@ from tpu_inference.utils import get_mesh_shape_product
 
 logger = init_logger(__name__)
 
+def _cdiv(a, b):
+    return (a + b - 1) // b
+
 
 def gdn_attention_core_tpu(
     mixed_qkv: torch.Tensor,
@@ -100,8 +103,19 @@ def gdn_attention_core_tpu(
     layer_idx = vllm_context.layer_name_to_kvcache_index[layer_name]
     conv_state, recurrent_state = vllm_context.kv_caches[layer_idx]
     state_len = conv_state.shape[1]
-    if state_len > kernel_size - 1:
-        conv_state_in = conv_state[:, :kernel_size - 1, :]
+
+    # Calculate tile size and pad to multiple of tile size.
+    item_size = conv_state.dtype.itemsize
+    min_tiling = 4 // item_size
+    max_tiling = 8 * min_tiling
+    tile_size = min_tiling
+    while tile_size < min(kernel_size - 1, max_tiling):
+      tile_size *= 2
+
+    padded_row = _cdiv(kernel_size - 1, tile_size) * tile_size 
+
+    if state_len > padded_row:
+        conv_state_in = conv_state[:, :padded_row, :]
     else:
         conv_state_in = conv_state
 
@@ -159,10 +173,11 @@ def gdn_attention_core_tpu(
          kernel_size,
          mesh=mesh,
          config=config)
+    # TODO: only concat when MTP is on.
     if state_len > kernel_size - 1:
         remaining_old_state = conv_state[:, kernel_size - 1:, :]
         new_conv_state = jnp.concatenate(
-            [new_conv_state_extracted, remaining_old_state], axis=1)
+            [new_conv_state_extracted[:, :kernel_size - 1, :], remaining_old_state], axis=1)
     else:
         new_conv_state = new_conv_state_extracted
 

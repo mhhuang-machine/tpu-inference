@@ -58,6 +58,29 @@ logger = init_logger(__name__)
 # N=num_blocks, H=num_heads and D=head_size
 DEFAULT_KV_CACHE_LAYOUT = "NHD"
 
+def _cdiv(a, b):
+  return (a + b - 1) // b
+
+def _get_mamba_conv_cache_shape(
+        layer_spec: MambaSpec,
+        dtype: jnp.dtype) -> tuple[int, ...]:
+    """Returns the TPU conv-state shape as [conv_len, cdiv(kernel_size, packing), packing, dim]."""
+    conv_shape = tuple(layer_spec.shapes[0])
+    if len(conv_shape) != 2 or len(layer_spec.shapes) < 2:
+        return conv_shape
+
+    state_length, dim = conv_shape
+
+    # Calculate tile size and pad to multiple of tile size.
+    item_size = jnp.dtype(dtype).itemsize
+    min_tiling = 4 // item_size
+    max_tiling = 8 * min_tiling
+    tile_size = min_tiling
+    while tile_size < min(state_length, max_tiling):
+      tile_size *= 2
+
+    padded_row = _cdiv(state_length, tile_size) * tile_size 
+    return (padded_row, dim)
 
 def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     return isinstance(attn_module, DeepseekV4IndexerCache) or isinstance(
@@ -828,18 +851,22 @@ class KVCacheManager:
                     for state_index, (shape, dtype) in enumerate(
                             zip(layer_spec.shapes, layer_spec.dtypes)):
                         jax_dtype = t2j_dtype(dtype)
-                        cache_shape = (mamba_num_blocks, *shape)
                         if state_index == 0:
+                            shape = _get_mamba_conv_cache_shape(layer_spec, jax_dtype)
+                            cache_shape = (mamba_num_blocks, *shape)
+
                             # conv_state: [num_blocks, conv_kernel_size, intermediate_size]
                             spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
                                                  None,
                                                  ShardingAxisName.ATTN_HEAD)
                         elif state_index == 1:
+                            cache_shape = (mamba_num_blocks, *shape)
                             # ssm_state: [num_blocks, num_heads, head_dim, state_size]
                             spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
                                                  ShardingAxisName.ATTN_HEAD,
                                                  None, None)
                         else:
+                            cache_shape = (mamba_num_blocks, *shape)
                             spec = PartitionSpec(
                                 None, *([None] * (len(cache_shape) - 1)))
 

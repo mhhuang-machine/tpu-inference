@@ -32,6 +32,7 @@ class ConvConfigs:
     dim_size: int
     kernel_size: int
     tile_size: int
+    padded_kernel_sz_minus_1: int
 
     @property
     def prev_kernel_size(self) -> int:
@@ -52,6 +53,7 @@ class MetadataRef:
     b_idx_to_s_idx: Any
     b_idx_to_sz_from_old: Any
     b_idx_should_write: Any
+    b_idx_to_query_start_loc: Any
     s_idx_to_state_idx: Any
     s_idx_has_initial_state: Any
 
@@ -146,26 +148,35 @@ class ConvStateBuffer(BufferWrapper):
             b_idx = b_start + idx
             s_idx = self.metadata_ref.b_idx_to_s_idx[b_idx]
             state_idx = self.metadata_ref.s_idx_to_state_idx[s_idx]
-            sz_from_old = self.metadata_ref.b_idx_to_sz_from_old[b_idx]
-            start_from_old = self.cfgs.prev_kernel_size - sz_from_old
-            sz_from_old = jnp.where(is_no_op, 0, sz_from_old)
+
+            # Example: query_start_loc = [0 0 2 3 3 3 6 6]
+            # tile size is 4. Second tile starts at b_start=4 and is [3 3 6 6]
+            # Index in vmem should be [0 0 2 2]
+            query_start_loc = self.metadata_ref.b_idx_to_query_start_loc[b_idx]
+            vmem_idx = jnp.maximum(0, query_start_loc - b_start)
+            should_load = vmem_idx == idx
+            rows_to_load = jnp.where(
+                is_no_op | (~should_load), 0, self.cfgs.padded_kernel_sz_minus_1
+            )
 
             pltpu.make_async_copy(
-                self.hbm_ref.at[state_idx,
-                                pl.ds(start_from_old, sz_from_old)],
-                self.get_slot_vmem(slot).at[idx, pl.ds(0, sz_from_old)],
+                self.hbm_ref.at[state_idx, pl.ds(0, rows_to_load)],
+                self.get_slot_vmem(slot).at[idx, pl.ds(0, rows_to_load)],
                 sem,
             ).start()
 
     def wait_in(self, b_start, slot, sem):
-        all_sz_from_old = 0
+        all_rows_to_load = 0
         for idx in range(self.cfgs.tile_size):
             b_idx = b_start + idx
-            all_sz_from_old += self.metadata_ref.b_idx_to_sz_from_old[b_idx]
+            query_start_loc = self.metadata_ref.b_idx_to_query_start_loc[b_idx]
+            vmem_idx = jnp.maximum(0, query_start_loc - b_start)
+            rows_to_load = jnp.where((vmem_idx == idx), 1, 0)
+            all_rows_to_load += rows_to_load
 
         pltpu.make_async_copy(
-            self.vmem_ref.at[0, 0, pl.ds(0, all_sz_from_old)],
-            self.vmem_ref.at[0, 0, pl.ds(0, all_sz_from_old)],
+            self.vmem_ref.at[0, pl.ds(0, all_rows_to_load)],
+            self.vmem_ref.at[0, pl.ds(0, all_rows_to_load)],
             sem,
         ).wait()
 
@@ -266,6 +277,13 @@ def inner_kernel(
 
     # NOTE: All conditionals below are static and evaluated during compile time.
     out_list = []
+    conv_state_fp32 = strided_ldst.load_large_to_compact(
+        conv_state_slot_ref.at[0], dst_dtype=jnp.float32
+    )
+
+    zeros_to_append = jnp.zeros(
+        (cfgs.prev_kernel_size, 1, cfgs.dim_size), dtype=jnp.float32
+    )
     for idx in range(cfgs.tile_size):
         b_idx = b_start + idx
 
@@ -274,6 +292,34 @@ def inner_kernel(
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
         out = jnp.zeros((1, cfgs.dim_size), jnp.float32)
+
+        # Determine whether current sequence is a continuation of an existing one.
+        prev_b_idx = jnp.maximum(0, b_idx - 1)
+        curr_s_idx = metadata_ref.b_idx_to_s_idx[b_idx]
+        prev_s_idx = metadata_ref.b_idx_to_s_idx[prev_b_idx]
+        is_continuation = curr_s_idx == prev_s_idx
+
+        # If it's a continuation of an existing seq, read from the existing
+        # conv_state_fp32.
+        conv_state_fp32 = jnp.where(
+            is_continuation,
+            conv_state_fp32,
+            strided_ldst.load_large_to_compact(
+                conv_state_slot_ref.at[idx], dst_dtype=jnp.float32
+            ),
+        )
+        start_from_old = cfgs.prev_kernel_size - sz_from_old
+        padded_conv_state_fp32 = jnp.concatenate(
+            [conv_state_fp32, zeros_to_append], axis=0
+        )
+        old_conv_state = padded_conv_state_fp32[0 : cfgs.prev_kernel_size]
+        for row_start in range(1, cfgs.prev_kernel_size):
+            old_conv_state = jnp.where(
+                row_start == start_from_old,
+                padded_conv_state_fp32[row_start : row_start + cfgs.prev_kernel_size],
+                old_conv_state,
+            )
+        new_conv_state_list = []
 
         for k in range(cfgs.kernel_size):
             # Computation for out[row] requires reading data
@@ -285,16 +331,28 @@ def inner_kernel(
             in_idx = idx + k
             lhs = x_compact[in_idx]
 
+            # TODO: this can be simplified now we read conv_state from a previous one
             if k < cfgs.prev_kernel_size:
-                conv_state = conv_state_slot_ref[idx, k]
+                conv_state = old_conv_state[k]
                 conv_state = jnp.where(has_initial_state, conv_state, 0)
                 lhs = jnp.where(k < sz_from_old, conv_state, lhs)
 
             if k > 0:
-                conv_state_slot_ref[idx, k - 1] = lhs
+                new_conv_state_list.append(lhs)
 
             rhs = conv_rhs_ref.weight[k]
             out += lhs * rhs
+
+        # Pad the updated_conv_state list
+        padding_rows = cfgs.padded_kernel_sz_minus_1 - cfgs.prev_kernel_size
+        padding_zeros = jnp.zeros((1, cfgs.dim_size), dtype=jnp.float32)
+        for _ in range(padding_rows):
+            new_conv_state_list.append(padding_zeros)
+
+        stacked_new_state = jnp.stack(new_conv_state_list, axis=0)
+        strided_ldst.store_compact_to_large(
+            conv_state_slot_ref.at[idx], stacked_new_state
+        )
 
         if conv_rhs_ref.bias is not None:
             bias = conv_rhs_ref.bias[...].reshape(1, -1)
@@ -307,7 +365,7 @@ def inner_kernel(
     strided_ldst.store_compact_to_large(x_slot_ref, out)
     # NOTE: Write last prev_kernel_size rows of data to scratch memory to allow
     # next tile to read from it.
-    prev_x_scratch_ref[...] = x_compact[cfgs.tile_size:]
+    prev_x_scratch_ref[...] = x_compact[cfgs.tile_size :]
 
     # Step 3: DMA epilogue.
 
@@ -393,15 +451,12 @@ def preprocess_metadata(
     # Mask out padded locations.
     num_tokens = query_start_loc[num_seqs]
     all_seqs = jnp.arange(max_seqs + 1)
-    query_start_loc = jnp.where(all_seqs <= num_seqs, query_start_loc,
-                                num_tokens)
+    query_start_loc = jnp.where(all_seqs <= num_seqs, query_start_loc, num_tokens)
 
     # Map batch index to sequence index.
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     seqs = jnp.arange(max_seqs)
-    b_idx_to_s_idx = jnp.repeat(seqs,
-                                query_lens,
-                                total_repeat_length=cfgs.batch_size)
+    b_idx_to_s_idx = jnp.repeat(seqs, query_lens, total_repeat_length=cfgs.batch_size)
     b_idx_query_start_loc = query_start_loc[b_idx_to_s_idx]
     all_b_idx = jnp.arange(cfgs.batch_size)
     b_idx_query_len = 1 + all_b_idx - b_idx_query_start_loc
@@ -410,8 +465,7 @@ def preprocess_metadata(
     # activation (new).
     b_idx_to_sz_from_new = jnp.minimum(b_idx_query_len, cfgs.kernel_size)
     b_idx_to_sz_from_old = cfgs.kernel_size - b_idx_to_sz_from_new
-    b_idx_to_sz_from_old = jnp.minimum(b_idx_to_sz_from_old,
-                                       cfgs.prev_kernel_size)
+    b_idx_to_sz_from_old = jnp.minimum(b_idx_to_sz_from_old, cfgs.prev_kernel_size)
 
     # Determine which row needs to write its conv_state to HBM.
     b_idx_should_write = all_b_idx == (query_start_loc[b_idx_to_s_idx + 1] - 1)
@@ -422,6 +476,7 @@ def preprocess_metadata(
         b_idx_to_s_idx=b_idx_to_s_idx,
         b_idx_to_sz_from_old=b_idx_to_sz_from_old,
         b_idx_should_write=b_idx_should_write,
+        b_idx_to_query_start_loc=b_idx_query_start_loc,
         s_idx_to_state_idx=state_indices,
         s_idx_has_initial_state=has_initial_state,
     )
@@ -433,7 +488,8 @@ def preprocess_metadata(
 )
 def ragged_causal_conv1d(
     x: jax.Array,  # (batch_size, dim_size)
-    conv_state: jax.Array,  # (max_num_seqs, kernel_size - 1, dim_size)
+    # (max_num_seqs, padded(kernel_size-1, dim_size)
+    conv_state: jax.Array,
     conv_weight: jax.Array,  # (dim_size, 1, kernel_size)
     conv_bias: jax.Array | None,  # (kernel_size,)
     query_start_loc: jax.Array,  # (max_num_seqs + 1,)
@@ -469,10 +525,10 @@ def ragged_causal_conv1d(
     batch_size, dim = x.shape
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
-        assert conv_bias.shape == (dim, )
-    assert query_start_loc.shape == (num_seqs + 1, )
-    assert state_indices.shape == (num_seqs, )
-    assert distribution.shape == (3, )
+        assert conv_bias.shape == (dim,)
+    assert query_start_loc.shape == (num_seqs + 1,)
+    assert state_indices.shape == (num_seqs,)
+    assert distribution.shape == (3,)
 
     # Step 2: Input pre-processing.
     x_dtype = x.dtype
@@ -487,9 +543,9 @@ def ragged_causal_conv1d(
     # TODO(kyuyeunk): Perform this during model loading to eliminate runtime cost.
     conv_state_shape = conv_state.shape
     conv_state_dtype = conv_state.dtype
-    # TODO(mhhuang): Remove the need for upcast.
-    conv_state = conv_state.astype(jnp.float32)
-    conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+    assert conv_state_dtype in [jnp.float32, jnp.bfloat16]
+    padded_kernel_sz_minus_1 = conv_state_shape[1]
+
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
         jnp.float32) if conv_bias is not None else None
@@ -499,6 +555,7 @@ def ragged_causal_conv1d(
         kernel_size=kernel_size,
         tile_size=tile_size,
         dim_size=dim,
+        padded_kernel_sz_minus_1=padded_kernel_sz_minus_1,
     )
 
     # Step 4: Metadata preprocessing.
@@ -521,6 +578,7 @@ def ragged_causal_conv1d(
     conv_rhs_spec = jax.tree.map(lambda _: vmem_spec, conv_rhs)
 
     # Step 7: Perform computation.
+    conv_state = pltpu.with_memory_space_constraint(conv_state, pltpu.HBM)
     out, new_conv_state = pl.pallas_call(
         functools.partial(main_kernel, cfgs=cfgs),
         out_shape=(x, conv_state),
@@ -529,11 +587,16 @@ def ragged_causal_conv1d(
         scratch_shapes=(
             pltpu.VMEM((2, cfgs.tile_size, cfgs.dim_size), x_dtype),
             pltpu.VMEM(
-                (2, cfgs.tile_size, cfgs.prev_kernel_size, 1, cfgs.dim_size),
-                jnp.float32,
+                (
+                    2,
+                    cfgs.tile_size,
+                    cfgs.padded_kernel_sz_minus_1,
+                    cfgs.dim_size,
+                ),
+                conv_state_dtype,
             ),
             pltpu.VMEM((cfgs.prev_kernel_size, 1, cfgs.dim_size), jnp.float32),
-            pltpu.SemaphoreType.DMA((2, )),
+            pltpu.SemaphoreType.DMA((2,)),
         ),
         input_output_aliases={
             len(metadata): 0,
@@ -545,7 +608,5 @@ def ragged_causal_conv1d(
 
     # Step 8: Output post-processing.
     out = out[:batch_size]
-    new_conv_state = new_conv_state.astype(conv_state_dtype)
-    new_conv_state = new_conv_state.reshape(conv_state_shape)
 
     return out, new_conv_state
