@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import vllm.envs as envs
 from jax.sharding import NamedSharding, PartitionSpec
+from jax.experimental.layout import Format, Layout
 from torchax.ops.mappings import t2j_dtype
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
 from vllm.model_executor.layers.attention import Attention
@@ -851,8 +852,18 @@ class KVCacheManager:
                                             c_dtype=jax_dtype):
                             return jnp.empty(shape=c_shape, dtype=c_dtype)
 
-                        mamba_allocate = jax.jit(_allocate_mamba,
-                                                 out_shardings=sharding)
+                        # mamba_allocate = jax.jit(_allocate_mamba,
+                        #                          out_shardings=sharding)
+                        if state_index == 0:
+                            mamba_allocate = jax.jit(
+                                    _allocate_mamba,
+                                    static_argnames=['c_shape', 'c_dtype'],
+                                    out_shardings=Format(Layout((0, 1, 2)), sharding))
+                        else:
+                            mamba_allocate = jax.jit(
+                                    _allocate_mamba,
+                                    static_argnames=['c_shape', 'c_dtype'],
+                                    out_shardings=sharding)
                         mamba_states.append(mamba_allocate())
 
                     metadata["mamba"].count += 1

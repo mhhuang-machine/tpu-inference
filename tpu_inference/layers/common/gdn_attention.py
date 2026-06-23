@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
+from jax.experimental.layout import Layout, with_layout_constraint
 
 import tpu_inference.layers.common.ragged_gated_delta_rule_wrapper as ragged_gated_delta_rule_wrapper
 from tpu_inference.kernels.causal_conv1d import causal_conv1d
@@ -281,6 +282,7 @@ def run_jax_gdn_attention(
         check_vma=False,
     )
 
+    conv_state = with_layout_constraint(conv_state, Layout((0, 1, 2)))
     (new_conv_state, new_recurrent_state), output = mapped_fn(
         j_mixed_qkv,
         j_b,
@@ -296,5 +298,6 @@ def run_jax_gdn_attention(
         distribution,
         seq_lens,
     )
+    new_conv_state = with_layout_constraint(new_conv_state, Layout((0, 1, 2)))
 
     return (new_conv_state, new_recurrent_state), output
