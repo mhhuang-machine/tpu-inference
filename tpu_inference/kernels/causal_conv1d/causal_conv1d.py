@@ -515,8 +515,7 @@ def ragged_causal_conv1d(
     conv_state_dim = conv_state_shape[-1]
     assert conv_state_dtype in [jnp.float32, jnp.bfloat16]
     packing = 4 // jnp.dtype(conv_state_dtype).itemsize
-    assert conv_state.shape == (
-        num_seqs + 1,
+    assert conv_state.shape[1:] == (
         kernel_size - 1,
         packing,
         conv_state_dim,
