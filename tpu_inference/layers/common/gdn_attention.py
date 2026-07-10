@@ -236,7 +236,8 @@ def run_jax_gdn_attention(
           ShardingAxisName.ATTN_HEAD),  # j_mixed_qkv
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_b
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_a
-        P(ShardingAxisName.ATTN_DATA, None,
+        # would need to make sure last dim is divisable by TP heads
+        P(ShardingAxisName.ATTN_DATA, None, None,
           ShardingAxisName.ATTN_HEAD),  # conv_state
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None,
           None),  # recurrent_state
@@ -253,7 +254,7 @@ def run_jax_gdn_attention(
 
     out_specs = (
         (
-            P(ShardingAxisName.ATTN_DATA, None,
+            P(ShardingAxisName.ATTN_DATA, None, None,
               ShardingAxisName.ATTN_HEAD),  # new_conv_state
             P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None,
               None),  # new_recurrent_state

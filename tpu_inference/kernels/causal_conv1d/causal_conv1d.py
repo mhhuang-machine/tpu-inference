@@ -32,10 +32,16 @@ class ConvConfigs:
     dim_size: int
     kernel_size: int
     tile_size: int
+    packing: int
+    packed_dim_size: int
 
     @property
     def prev_kernel_size(self) -> int:
         return self.kernel_size - 1
+
+    @property
+    def padded_dim_size(self) -> int:
+        return self.packing * self.packed_dim_size
 
 
 @jax.tree_util.register_dataclass
@@ -275,6 +281,10 @@ def inner_kernel(
 
         out = jnp.zeros((1, cfgs.dim_size), jnp.float32)
 
+        compact_conv_state = strided_ldst.load_large_to_compact_for_conv_state(
+            conv_state_slot_ref.at[idx], jnp.float32
+        )
+        new_conv_state = []
         for k in range(cfgs.kernel_size):
             # Computation for out[row] requires reading data
             # x[row - (kernel_size - 1) + k] where k iterates from 0 to
@@ -286,15 +296,29 @@ def inner_kernel(
             lhs = x_compact[in_idx]
 
             if k < cfgs.prev_kernel_size:
-                conv_state = conv_state_slot_ref[idx, k]
+                conv_state = compact_conv_state[k]
+                conv_state = conv_state[:, : cfgs.dim_size]
                 conv_state = jnp.where(has_initial_state, conv_state, 0)
                 lhs = jnp.where(k < sz_from_old, conv_state, lhs)
 
             if k > 0:
-                conv_state_slot_ref[idx, k - 1] = lhs
+                # Flattening to 1D to hint mosaic to use [1, 128] tiling for padding.
+                padded_lhs = jnp.pad(
+                    lhs.reshape(-1),
+                    (0, cfgs.padded_dim_size - cfgs.dim_size),
+                )
+                lhs_for_next = padded_lhs.reshape(1, -1)
+                new_conv_state.append(lhs_for_next)
 
             rhs = conv_rhs_ref.weight[k]
             out += lhs * rhs
+
+        # vreg [kernel_size - 1, 1, packing * packed_dim_size]
+        # vmem [kernel_size - 1, packing, packed_dim_size]
+        strided_ldst.store_compact_to_large_for_conv_state(
+            conv_state_slot_ref.at[idx],
+            jnp.stack(new_conv_state, axis=0),
+        )
 
         if conv_rhs_ref.bias is not None:
             bias = conv_rhs_ref.bias[...].reshape(1, -1)
@@ -433,7 +457,8 @@ def preprocess_metadata(
 )
 def ragged_causal_conv1d(
     x: jax.Array,  # (batch_size, dim_size)
-    conv_state: jax.Array,  # (max_num_seqs, kernel_size - 1, dim_size)
+    # (max_num_seqs, kernel_size - 1, packing, cdiv(padded dim_size, packing))
+    conv_state: jax.Array,
     conv_weight: jax.Array,  # (dim_size, 1, kernel_size)
     conv_bias: jax.Array | None,  # (kernel_size,)
     query_start_loc: jax.Array,  # (max_num_seqs + 1,)
@@ -487,9 +512,15 @@ def ragged_causal_conv1d(
     # TODO(kyuyeunk): Perform this during model loading to eliminate runtime cost.
     conv_state_shape = conv_state.shape
     conv_state_dtype = conv_state.dtype
-    # TODO(mhhuang): Remove the need for upcast.
-    conv_state = conv_state.astype(jnp.float32)
-    conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+    conv_state_dim = conv_state_shape[-1]
+    assert conv_state_dtype in [jnp.float32, jnp.bfloat16]
+    packing = 4 // jnp.dtype(conv_state_dtype).itemsize
+    assert conv_state.shape == (
+        num_seqs + 1,
+        kernel_size - 1,
+        packing,
+        conv_state_dim,
+    )
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
         jnp.float32) if conv_bias is not None else None
@@ -499,6 +530,8 @@ def ragged_causal_conv1d(
         kernel_size=kernel_size,
         tile_size=tile_size,
         dim_size=dim,
+        packed_dim_size=conv_state_dim,
+        packing=packing,
     )
 
     # Step 4: Metadata preprocessing.
@@ -529,8 +562,14 @@ def ragged_causal_conv1d(
         scratch_shapes=(
             pltpu.VMEM((2, cfgs.tile_size, cfgs.dim_size), x_dtype),
             pltpu.VMEM(
-                (2, cfgs.tile_size, cfgs.prev_kernel_size, 1, cfgs.dim_size),
-                jnp.float32,
+                (
+                    2,
+                    cfgs.tile_size,
+                    cfgs.prev_kernel_size,
+                    cfgs.packing,
+                    cfgs.packed_dim_size,
+                ),
+                conv_state_dtype,
             ),
             pltpu.VMEM((cfgs.prev_kernel_size, 1, cfgs.dim_size), jnp.float32),
             pltpu.SemaphoreType.DMA((2, )),
@@ -545,7 +584,5 @@ def ragged_causal_conv1d(
 
     # Step 8: Output post-processing.
     out = out[:batch_size]
-    new_conv_state = new_conv_state.astype(conv_state_dtype)
-    new_conv_state = new_conv_state.reshape(conv_state_shape)
 
     return out, new_conv_state

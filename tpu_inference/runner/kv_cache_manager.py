@@ -65,6 +65,36 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
             attn_module, DeepseekV4Attention) or isinstance(
                 attn_module, CompressorStateCache)
 
+def _get_mamba_conv_cache_shape(
+        layer_spec: MambaSpec,
+        packing: int = 1,
+        tp_size: int = 1) -> tuple[int, ...]:
+    """Returns the TPU conv-state shape as [conv_len, kernel_size-1, packing, cdiv(padded_dim, packing)]."""
+    conv_shape = tuple(layer_spec.shapes[0])
+    if len(conv_shape) != 2 or len(layer_spec.shapes) < 2:
+        return conv_shape
+
+    kernel_sz_minus_1, dim = conv_shape
+    align_to = packing * tp_size * 8 * 128
+    padded_dim = (dim + align_to - 1) // align_to * align_to
+    new_dim = padded_dim // packing
+
+    return (kernel_sz_minus_1, packing, new_dim)
+
+
+def _update_conv_shape_in_mamba_spec(
+    mamba_spec: MambaSpec,
+    packing: int = 1,
+    tp_size: int = 1) -> MambaSpec:
+    new_conv_shape = _get_mamba_conv_cache_shape(mamba_spec, packing, tp_size)
+    new_shapes = list(mamba_spec.shapes)
+    new_shapes[0] = new_conv_shape
+    return dataclasses.replace(
+        mamba_spec,
+        shapes=tuple(new_shapes),
+        page_size_padded=None,
+    )
+
 
 class KVCacheManager:
 
@@ -219,8 +249,12 @@ class KVCacheManager:
         first_mamba_spec = mamba_modules[0].get_kv_cache_spec(
             self.runner.vllm_config)
         assert isinstance(first_mamba_spec, MambaSpec)
-        unpadded_mamba_page_size = dataclasses.replace(
-            first_mamba_spec, page_size_padded=None).page_size_bytes
+        tp_axis_name = ShardingAxisName.ATTN_HEAD
+        model_cnt = common_utils.get_mesh_shape_product(
+            self.runner.mesh, tp_axis_name)
+        updated_mamba_spec = _update_conv_shape_in_mamba_spec(first_mamba_spec, 2, model_cnt)
+
+        unpadded_mamba_page_size = updated_mamba_spec.page_size_bytes
 
         # Derive vLLM's kv-cache group layout. vLLM splits each type into
         # equal-sized groups of `group_size` layers, then allocates
@@ -821,6 +855,9 @@ class KVCacheManager:
             if self.actual_mamba_num_blocks is None:
                 self.actual_mamba_num_blocks = mamba_num_blocks
 
+            tp_axis_name = ShardingAxisName.ATTN_HEAD
+            model_cnt = common_utils.get_mesh_shape_product(
+                self.runner.mesh, tp_axis_name)
             for j, layer_name in enumerate(kv_cache_tensor.shared_by):
                 layer_spec = layer_name_to_spec[layer_name]
                 if isinstance(layer_spec, MambaSpec):
@@ -828,18 +865,25 @@ class KVCacheManager:
                     for state_index, (shape, dtype) in enumerate(
                             zip(layer_spec.shapes, layer_spec.dtypes)):
                         jax_dtype = t2j_dtype(dtype)
-                        cache_shape = (mamba_num_blocks, *shape)
+
+
+                        # cache_shape = (mamba_num_blocks, *shape)
                         if state_index == 0:
                             # conv_state: [num_blocks, conv_kernel_size, intermediate_size]
+                            shape = _get_mamba_conv_cache_shape(layer_spec, 2, model_cnt)
+                            cache_shape = (mamba_num_blocks, *shape)
                             spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
+                                                 None,
                                                  None,
                                                  ShardingAxisName.ATTN_HEAD)
                         elif state_index == 1:
                             # ssm_state: [num_blocks, num_heads, head_dim, state_size]
+                            cache_shape = (mamba_num_blocks, *shape)
                             spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
                                                  ShardingAxisName.ATTN_HEAD,
                                                  None, None)
                         else:
+                            cache_shape = (mamba_num_blocks, *shape)
                             spec = PartitionSpec(
                                 None, *([None] * (len(cache_shape) - 1)))
 

@@ -52,7 +52,9 @@ def load_large_to_compact(vmem_ref,
 
 
 def store_compact_to_large(vmem_ref, vreg: jax.Array):
-    row_size = vmem_ref.shape[0]
+    dst_row_size = vmem_ref.shape[0]
+    src_row_size = vreg.shape[0]
+
     src_dtype = vreg.dtype
     dst_dtype = vmem_ref.dtype
     should_pack = src_dtype != dst_dtype
@@ -63,8 +65,9 @@ def store_compact_to_large(vmem_ref, vreg: jax.Array):
     assert vreg.shape[-2] == src_packing
     assert vmem_ref.ndim == 2
     assert vmem_ref.shape[-1] == vreg.shape[-1]
+    assert src_row_size == dst_row_size
 
-    for row_start in range(0, row_size, dst_packing):
+    for row_start in range(0, dst_row_size, dst_packing):
         row_end = row_start + dst_packing
         packed_row = row_start // dst_packing
         if should_pack:
@@ -78,3 +81,65 @@ def store_compact_to_large(vmem_ref, vreg: jax.Array):
             u32_vmem_ref[packed_row:packed_row + 1] = packed
         else:
             vmem_ref[row_start:row_end] = vreg[packed_row]
+
+
+def load_large_to_compact_for_conv_state(
+    vmem_ref,  # (kernel_size - 1, packing, packed_dim_size)
+    dst_dtype: jnp.dtype | None = None,
+) -> jax.Array:  # (kernel_size - 1, 1, packing * packed_dim_size)
+    assert vmem_ref.ndim == 3
+
+    src_row_size = vmem_ref.shape[0]
+    src_dtype = vmem_ref.dtype
+    should_unpack = dst_dtype is not None and dst_dtype != src_dtype
+    packing = 4 // src_dtype.itemsize
+
+    unpacked_list = []
+    for row_idx in range(src_row_size):
+        if should_unpack:
+            u32_vmem_ref = vmem_ref.bitcast(jnp.uint32)
+            concat_list = []
+            packed = u32_vmem_ref[row_idx]
+            for p in range(packing):
+                unpacked = pltpu.unpack_elementwise(
+                    packed, index=p, packed_dtype=src_dtype, unpacked_dtype=dst_dtype
+                )
+                # Flattening to 1D to hint mosaic to use [1, 128] tiling for concat.
+                concat_list.append(unpacked.reshape(-1))
+            result = jnp.concat(concat_list, axis=0)
+            unpacked_list.append(result.reshape(1, -1))
+        else:
+            unpacked_list.append(vmem_ref[row_idx])
+
+    return jnp.stack(unpacked_list, axis=0)
+
+
+def store_compact_to_large_for_conv_state(
+    vmem_ref,  # (kernel_size - 1, packing, packed_dim_size)
+    vreg: jax.Array,  # (kernel_size - 1, 1, packing * packed_dim_size)
+):
+    dst_row_size = vmem_ref.shape[0]
+    src_row_size = vreg.shape[0]
+    assert src_row_size == dst_row_size
+
+    src_dtype = vreg.dtype
+    dst_dtype = vmem_ref.dtype
+    should_pack = src_dtype != dst_dtype
+    src_packing = 4 // src_dtype.itemsize
+    dst_packing = 4 // dst_dtype.itemsize
+
+    assert vreg.ndim == 3
+    assert vreg.shape[-2] == src_packing
+    assert vmem_ref.ndim == 3
+    assert vmem_ref.shape[-2] == dst_packing
+
+    u32_vmem_ref = vmem_ref.bitcast(jnp.uint32)
+    for row_idx in range(dst_row_size):
+        if should_pack:
+            assert src_dtype.itemsize == 4
+            assert dst_dtype.itemsize == 2
+            unpacked_list = jnp.split(vreg[row_idx], dst_packing, axis=-1)
+            packed = pltpu.pack_elementwise(unpacked_list, packed_dtype=dst_dtype)
+            u32_vmem_ref[row_idx] = packed
+        else:
+            vmem_ref[row_idx] = vreg[row_idx]
