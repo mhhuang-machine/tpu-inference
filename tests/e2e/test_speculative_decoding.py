@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -78,7 +78,8 @@ def get_eagle3_test_prompts():
 def get_test_prompts(speculative_config: dict):
     if speculative_config['method'] == 'ngram':
         return get_ngram_test_prompts()
-    elif speculative_config['method'] in ('eagle3', 'qwen3_next_mtp', 'mtp'):
+    elif speculative_config['method'] in ('eagle3', 'qwen3_next_mtp', 'mtp',
+                                          'dflash'):
         return get_eagle3_test_prompts()
     else:
         raise NotImplementedError(
@@ -223,6 +224,10 @@ def _test_correctness_helper(
         spec_llm.llm_engine.engine_core.shutdown()
 
 
+# @pytest.mark.bvt selects a case into the fast per-push smoke set (the "- bvt"
+# pipeline step sets BVT_ONLY=1). Mark any new smoke-worthy case so it runs on
+# PRs; unmarked cases here run only in the full nightly matrix.
+@pytest.mark.bvt
 def test_ngram_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -356,6 +361,7 @@ def _test_performance_helper(
         assert acceptance_rate >= min_acceptance_rate, f"Expected at least {min_acceptance_rate:.2%} acceptance rate for {speculative_config['method']}, got {acceptance_rate:.2%}"
 
 
+@pytest.mark.bvt
 def test_ngram_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -430,10 +436,10 @@ def eagle3_baseline():
 @pytest.mark.parametrize(
     "async_scheduling, enable_dp_attention",
     [
-        (False, False),
+        pytest.param(False, False, marks=pytest.mark.bvt),
         (False, True),
         (True, False),
-        (True, True),
+        pytest.param(True, True, marks=pytest.mark.bvt),
     ],
 )
 def test_eagle3_correctness(
@@ -473,7 +479,8 @@ def test_eagle3_correctness(
 
 @pytest.mark.parametrize(
     "max_num_seqs,async_scheduling, enable_dp_attention",
-    [(1, False, False), (20, True, False), (20, True, True)],
+    [(1, False, False), (20, True, False),
+     pytest.param(20, True, True, marks=pytest.mark.bvt)],
 )
 def test_eagle3_performance(
     monkeypatch: pytest.MonkeyPatch,
@@ -503,6 +510,107 @@ def test_eagle3_performance(
         async_scheduling=async_scheduling,
         enable_dp_attention=enable_dp_attention,
         model_name='meta-llama/Llama-3.1-8B-Instruct')
+
+
+@pytest.fixture(scope="module")
+def dflash_baseline():
+    """Compute the DFlash reference prompts and baseline outputs once."""
+    model_name = 'meta-llama/Llama-3.1-8B-Instruct'
+    sampling_config = SamplingParams(temperature=0,
+                                     max_tokens=32,
+                                     ignore_eos=True,
+                                     repetition_penalty=1,
+                                     frequency_penalty=0,
+                                     presence_penalty=0,
+                                     min_p=0,
+                                     logprobs=None)
+    test_prompts = get_eagle3_test_prompts()
+    with pytest.MonkeyPatch.context() as mp:
+        ref_outputs = _get_baseline_results(
+            mp,
+            sampling_config,
+            model_name,
+            test_prompts,
+            max_num_seqs=10,
+            extra_kwargs={"gpu_memory_utilization": 0.85})
+    return test_prompts, ref_outputs
+
+
+@pytest.mark.parametrize(
+    "async_scheduling, enable_dp_attention",
+    [
+        pytest.param(False, False, marks=pytest.mark.bvt),
+        (True, False),
+    ],
+)
+def test_dflash_correctness(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    async_scheduling: bool,
+    enable_dp_attention: bool,
+    dflash_baseline: tuple,
+):
+    """Compare the outputs of a original LLM and a speculative LLM.
+
+    Should be the same when using DFlash speculative decoding.
+    """
+    model_name = 'meta-llama/Llama-3.1-8B-Instruct'
+
+    model_impl = os.environ.get("MODEL_IMPL_TYPE", "flax_nnx")
+    monkeypatch.setenv("MODEL_IMPL_TYPE", model_impl)
+    monkeypatch.setenv("DRAFT_MODEL_IMPL_TYPE", model_impl)
+
+    speculative_config = {
+        'model': "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat",
+        "num_speculative_tokens": 9,
+        "method": "dflash",
+        "draft_tensor_parallel_size": 1
+    }
+    test_prompts, ref_outputs = dflash_baseline
+
+    _test_correctness_helper(monkeypatch,
+                             sampling_config,
+                             model_name,
+                             speculative_config,
+                             test_prompts,
+                             ref_outputs=ref_outputs,
+                             max_num_seqs=10,
+                             async_scheduling=async_scheduling,
+                             enable_dp_attention=enable_dp_attention,
+                             extra_kwargs={"gpu_memory_utilization": 0.85})
+
+
+@pytest.mark.parametrize(
+    "max_num_seqs,async_scheduling, enable_dp_attention",
+    [(1, False, False),
+     pytest.param(20, True, False, marks=pytest.mark.bvt)],
+)
+def test_dflash_performance(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
+    enable_dp_attention: bool,
+):
+    """Test that DFlash speculative decoding achieves the expected acceptance rate."""
+    model_impl = os.environ.get("MODEL_IMPL_TYPE", "flax_nnx")
+    monkeypatch.setenv("MODEL_IMPL_TYPE", model_impl)
+    monkeypatch.setenv("DRAFT_MODEL_IMPL_TYPE", model_impl)
+
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config, {
+            "method": "dflash",
+            "model": "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat",
+            "num_speculative_tokens": 9,
+            "draft_tensor_parallel_size": 1
+        },
+        min_acceptance_rate=0.40,
+        max_num_seqs=max_num_seqs,
+        async_scheduling=async_scheduling,
+        enable_dp_attention=enable_dp_attention,
+        model_name='meta-llama/Llama-3.1-8B-Instruct',
+        extra_kwargs={"gpu_memory_utilization": 0.85})
 
 
 @pytest.fixture(scope="module")
@@ -551,9 +659,9 @@ def mtp_baseline():
 @pytest.mark.parametrize(
     "async_scheduling, enable_dp_attention",
     [
-        (False, False),
+        pytest.param(False, False, marks=pytest.mark.bvt),
         (True, False),
-        (True, True),
+        pytest.param(True, True, marks=pytest.mark.bvt),
     ],
 )
 def test_mtp_correctness(
@@ -594,7 +702,8 @@ def test_mtp_correctness(
 
 @pytest.mark.parametrize(
     "max_num_seqs,async_scheduling, enable_dp_attention",
-    [(1, False, False), (20, True, False), (20, True, True)],
+    [(1, False, False),
+     pytest.param(20, True, False, marks=pytest.mark.bvt), (20, True, True)],
 )
 def test_mtp_performance(
     monkeypatch: pytest.MonkeyPatch,

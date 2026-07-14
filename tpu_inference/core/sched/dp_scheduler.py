@@ -144,6 +144,10 @@ def _scheduler_worker_process(
     original_scheduler_cls: type,
 ):
     """Worker process that manages a single scheduler instance."""
+    import atexit
+    import gc
+    atexit._clear()
+    gc.enable()
     # Initialize the scheduler in this process
     import inspect
     sig = inspect.signature(original_scheduler_cls)
@@ -439,6 +443,11 @@ class DPScheduler(SchedulerInterface):
         self.output_conns: List[Connection] = []  # child writes, parent reads
         self.processes: List[Process] = []
 
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        gc.freeze()
+
         for rank in range(self.dp_size):
             # Each pipe gives (parent_end, child_end)
             # Input pipe: parent sends commands, child receives
@@ -471,6 +480,9 @@ class DPScheduler(SchedulerInterface):
             input_child_conn.close()
             output_child_conn.close()
             self.processes.append(process)
+
+        if gc_was_enabled:
+            gc.enable()
 
         # Reverse mapping from output connection to rank for wait()-based collection.
         self._output_conn_to_rank: Dict[int, int] = {
@@ -1110,6 +1122,16 @@ class DPScheduler(SchedulerInterface):
         We need to route the model runner output to the appropriate scheduler
         based on which rank each request belongs to.
         """
+        cached_data = scheduler_output.scheduled_cached_reqs
+        num_output_tokens_dict = dict(
+            zip(cached_data.req_ids, cached_data.num_output_tokens))
+
+        for req_id, req_idx in model_runner_output.req_id_to_index.items():
+            if num_output_tokens_dict.get(req_id, 0) > 0:
+                if model_runner_output.sampled_token_ids:
+                    scheduler_output.num_scheduled_tokens[req_id] = len(
+                        model_runner_output.sampled_token_ids[req_idx])
+
         # Split model output by DP rank (each rank gets only its req_ids).
         rank_model_outputs = self._split_model_output_by_rank(
             scheduler_output, model_runner_output)

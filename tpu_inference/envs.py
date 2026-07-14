@@ -44,14 +44,6 @@ if TYPE_CHECKING:
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
-    RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
-    # SparseCore MoE gather kernel version used by fused_moe_gmm.
-    # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
-    RAGGED_GATHER_VERSION: str = "v2"
-    # SparseCore MoE gather-reduce (combine) kernel version used by
-    # fused_moe_gmm. "v2" (default) = ragged_gather_reduce_v2; "v1" = legacy
-    # ragged_gather_reduce.
-    RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     MOE_ALL_GATHER_ACTIVATION_DTYPE: str = ""
     TPU_OFFLOAD_SKIP_JAX_PRECOMPILE: bool = False
     TPU_OFFLOAD_DECODE_SAVE: bool = False
@@ -74,6 +66,9 @@ if TYPE_CHECKING:
     PROFILE_SINGLE_DEVICE: bool = False
     LORA_MODULE_PATH: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: str = "auto"
+    SLICE_ROPE_CACHE: bool = False
+    MIN_TOKEN_BUCKET: int = 16
+    MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
 
 
 def env_with_choices(
@@ -331,19 +326,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_str_list("JITTED_MM_MODULE_KEYS"),
     "REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES":
     env_str_list("REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES"),
-    "RAGGED_GATED_DELTA_RULE_IMPL":
-    env_with_choices(
-        "RAGGED_GATED_DELTA_RULE_IMPL",
-        "chunked_jax_pd",
-        [
-            "chunked_jax_pd", "chunked_kernel_pd",
-            "chunked_kernel_p_recurrent_kernel_d"
-        ],
-    ),
-    "RAGGED_GATHER_VERSION":
-    env_with_choices("RAGGED_GATHER_VERSION", "v2", ["v1", "v2"]),
-    "RAGGED_GATHER_REDUCE_VERSION":
-    env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2"]),
     "MOE_ALL_GATHER_ACTIVATION_DTYPE":
     lambda: os.getenv("MOE_ALL_GATHER_ACTIVATION_DTYPE", ""),
     # kv offload to dram: skip pre-compiling swap-related jax functions
@@ -425,8 +407,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use VMEM size as the threshold.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES":
     lambda: os.getenv("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", "auto"),
+    # Slice the rotary cos_sin_cache to max_model_len at load (saves HBM and a
+    # per-step layout copy of the full max_position_embeddings table). Applies
+    # to text / 1-D RoPE only; ignored for MRoPE models, whose (video)
+    # positions can exceed max_model_len.
+    "SLICE_ROPE_CACHE":
+    env_bool("SLICE_ROPE_CACHE", default=False),
     "MLA_TRANSPOSE_KV_CACHE":
     env_bool("MLA_TRANSPOSE_KV_CACHE", default=False),
+    # Minimum max num of batched tokens.
+    "MIN_TOKEN_BUCKET":
+    lambda: int(os.getenv("MIN_TOKEN_BUCKET") or "16"),
+    # Route padding tokens to expert 0 instead of picking other experts, to
+    # avoid activating unneeded experts and speed up the GMM kernel by not
+    # loading unnecessary weights. Only applies when DP attention size is 1
+    # (pure TP attention, e.g. TP8_EP), since under DP attention the padding
+    # is interleaved per rank and a single valid-token count cannot describe it.
+    "MOE_ROUTE_PADDING_TO_EXPERT0":
+    env_bool("MOE_ROUTE_PADDING_TO_EXPERT0", default=False),
 }
 
 

@@ -129,8 +129,9 @@ def convert_torch_to_jax_with_view(loaded_weight: torch.Tensor,
     bit representation using a dtype view map.
     """
     torch_view_type = DTYPE_VIEW_MAP.get(jnp.dtype(cast_type))
-    loaded_weight = jnp.array(
-        loaded_weight.view(torch_view_type).numpy()).view(cast_type)
+    np_arr = loaded_weight.view(torch_view_type).numpy()
+    with cpu_mesh_context():
+        loaded_weight = jnp.array(np_arr).view(cast_type)
     return loaded_weight
 
 
@@ -777,7 +778,7 @@ def assign_and_shard_param(jax_param: nnx.Param,
         param_name: The name of the parameter, used for error logging.
         mesh: The device mesh to shard the parameter on.
     """
-    spec = jax_param.get_metadata().get("sharding", ())
+    spec = jax_param.get_metadata().get("out_sharding", ())
     if isinstance(spec, NamedSharding):
         spec = spec.spec
     elif isinstance(spec, SingleDeviceSharding):
@@ -788,7 +789,6 @@ def assign_and_shard_param(jax_param: nnx.Param,
         jax_param.set_value(shard_put(jax_weight, spec, mesh=param_mesh))
         jax_param.set_metadata("_is_loaded", True)
         del jax_weight
-        jax.clear_caches()
     except Exception as e:
         raise RuntimeError(
             f"Failed to load weight '{param_name}' with shape {shape} into param with shape {jax_param.get_value().shape}"
@@ -798,6 +798,7 @@ def assign_and_shard_param(jax_param: nnx.Param,
 def load_nnx_param_from_reshaped_torch(
         jax_param: nnx.Param,
         torch_weight: torch.Tensor,
+        _shard_id: int = -1,
         *,
         reshape_dims: Optional[tuple[int, ...]] = None,
         permute_dims: Optional[tuple[int, ...]] = None,
@@ -981,6 +982,27 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
                     yield name, weight
 
         autoloaded = super().load_weights(_route(weights), **kwargs)
+
+        # Routed weights are written directly into their fused param via
+        # `weight_loader` above and never re-enter the streaming weights
+        # iterator, so the recursive `_load_module` (which normally fires a
+        # module's `quant_method.process_weights_after_loading` right after
+        # its own weights are consumed, see override below) never visits
+        # these fused modules. Trigger that post-load step explicitly here
+        # (e.g. FP8 blockwise requant of a merged gate_up_proj/qkv_proj).
+        if routed_loaded:
+            modules_by_name = dict(self.module.named_modules())
+            processed_modules: set = set()
+            for fused_param_name in routed_loaded:
+                module_name = fused_param_name.rsplit(".", 1)[0]
+                if module_name in processed_modules:
+                    continue
+                processed_modules.add(module_name)
+                module = modules_by_name.get(module_name)
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    quant_method.process_weights_after_loading(module)
+        jax.clear_caches()
         return autoloaded | routed_loaded
 
     def _add_loadable_non_param_tensors(self, module: JaxModule,
