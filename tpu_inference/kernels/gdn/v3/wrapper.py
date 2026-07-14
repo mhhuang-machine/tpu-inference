@@ -101,10 +101,16 @@ def inner_kernel(
         cfg=cfg,
     )
 
-    conv_state_slot_ref[...] = new_conv_state
-    if carry_conv_scratch_ref is not None:
-        carry_conv_scratch_ref[...] = new_conv_state
-
+#     conv_state_slot_ref[...] = new_conv_state
+#     if carry_conv_scratch_ref is not None:
+#         carry_conv_scratch_ref[...] = new_conv_state
+    vmem_ldst.store_conv_state(
+        conv_state_slot_ref=conv_state_slot_ref,
+        carry_conv_scratch_ref=carry_conv_scratch_ref,
+        new_conv_state=new_conv_state,
+        cfg=cfg,
+    )
+ 
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
 
@@ -337,15 +343,12 @@ def fused_conv1d_gdn(
             recurrent state cache tensors.
         out: Fused output tensor.
     """
-    # TODO(kyuyeunk): Support bf16
     act_out_dtype = qkv.dtype
-    conv_out_dtype = conv_state.dtype
     recurrent_out_dtype = recurrent_state.dtype
 
     qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
-    conv_state = conv_state.astype(jnp.float32)
 
     # Step 1: Validate inputs.
     num_seqs = state_indices.size
@@ -380,7 +383,12 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
     # loading stage.
     conv_state_shape = conv_state.shape
-    conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+    conv_state_dtype = conv_state.dtype
+    conv_state_dim_size = conv_state_shape[-1]
+    assert conv_state_dtype in [jnp.float32, jnp.bfloat16]
+    conv_state_packing = 4 // jnp.dtype(conv_state_dtype).itemsize
+    assert conv_state.shape[-2] == conv_state_packing
+
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
         jnp.float32) if conv_bias is not None else None
@@ -414,6 +422,7 @@ def fused_conv1d_gdn(
             kernel_size=kernel_size,
             tile_size=tile_size,
             dim_size=dim,
+            conv_state_dim_size=conv_state_dim_size,
             num_kq_heads=n_kq,
             num_v_heads=n_v,
             kq_head_dim=d_k,
@@ -464,6 +473,8 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 5] = 0
 
+        in_conv_state = pltpu.with_memory_space_constraint(in_conv_state, pltpu.HBM)
+
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
             out_shape=(out_shape, in_conv_state, in_recurrent_state),
@@ -503,8 +514,6 @@ def fused_conv1d_gdn(
         out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
-    out_conv_state = out_conv_state.astype(conv_out_dtype)
-    out_conv_state = out_conv_state.reshape(conv_state_shape)
     out_recurrent_state = out_recurrent_state.astype(recurrent_out_dtype)
 
     return (out_conv_state, out_recurrent_state), out_act

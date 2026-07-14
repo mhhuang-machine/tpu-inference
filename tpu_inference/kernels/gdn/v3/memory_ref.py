@@ -343,7 +343,12 @@ def create_allocs(
         cfg.num_v_heads,
         cfg.v_head_dim,
     )
-    conv_shape = (cfg.seq_tile_size, cfg.prev_kernel_size, 1, cfg.dim_size)
+    conv_shape = (
+        cfg.seq_tile_size,
+        cfg.prev_kernel_size,
+        cfg.conv_state_packing,
+        cfg.conv_state_dim_size,
+    )
     recurrent_shape = (
         cfg.seq_tile_size,
         cfg.num_v_heads,

@@ -54,6 +54,7 @@ class GDNConfig:
     dtypes: Dtypes
     batch_size: int
     dim_size: int
+    conv_state_dim_size: int
     kernel_size: int
     tile_size: int
     num_kq_heads: int
@@ -73,6 +74,14 @@ class GDNConfig:
     @property
     def prev_kernel_size(self) -> int:
         return self.kernel_size - 1
+
+    @property
+    def conv_state_packing(self) -> int:
+        return 4 // jnp.dtype(self.dtypes.conv_state).itemsize
+
+    @property
+    def conv_state_padded_dim_size(self) -> int:
+        return self.conv_state_packing * self.conv_state_dim_size
 
     @property
     def v_dim_size(self) -> int:
@@ -117,8 +126,12 @@ class GDNConfig:
         return int(0.7 * tpu_info.vmem_capacity_bytes)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
-        conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1,
-                      self.dim_size)
+        conv_shape = (
+            self.seq_tile_size,
+            self.prev_kernel_size,
+            self.conv_state_packing,
+            self.conv_state_dim_size,
+        )
         recurrent_shape = (
             self.seq_tile_size,
             self.num_v_heads,
@@ -130,7 +143,7 @@ class GDNConfig:
         # NOTE: Currently, batched mode only supports case where 1 seq = 1 tile.
         # Therefore, inter tile carry is not needed.
         if self.mode != GDNMode.BATCHED:
-            carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
+            carry_conv_scratch = pltpu.VMEM(conv_shape, self.dtypes.conv_state)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
         return dict(

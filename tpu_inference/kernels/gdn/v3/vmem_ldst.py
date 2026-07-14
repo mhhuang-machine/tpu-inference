@@ -121,7 +121,7 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     assert vmem_ref.dtype.itemsize == 4
     assert vmem_ref.shape[-2] == 1
     col_size = vmem_ref.shape[-1]
-    new_shape = vmem_ref.shape[:-2] + (col_size, )
+    new_shape = vmem_ref.shape[:-2] + (col_size,)
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
 
@@ -132,6 +132,101 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
         vreg = vmem_ref[..., col_start:col_end]
         vreg_list.append(vreg)
     return jnp.concat(vreg_list, axis=-1).reshape(new_shape)
+
+
+def load_large_to_compact_for_conv_state(
+    vmem_ref: jax.Ref,  # (kernel_size - 1, packing, packed_dim_size)
+    dst_dtype: jnp.dtype | None = None,
+) -> jax.Array:  # (kernel_size - 1, 1, packing * packed_dim_size)
+    assert vmem_ref.ndim == 3
+
+    src_row_size = vmem_ref.shape[0]
+    src_dtype = vmem_ref.dtype
+    should_unpack = dst_dtype is not None and dst_dtype != src_dtype
+    packing = 4 // src_dtype.itemsize
+
+    unpacked_list = []
+    if should_unpack:
+        u32_vmem_ref = vmem_ref.bitcast(jnp.uint32)
+        for row_idx in range(src_row_size):
+            concat_list = []
+            packed = u32_vmem_ref[row_idx]
+            for p in range(packing):
+                unpacked = pltpu.unpack_elementwise(
+                    packed, index=p, packed_dtype=src_dtype, unpacked_dtype=dst_dtype
+                )
+                # Flattening to 1D to hint mosaic to use [1, 128] tiling for concat.
+                concat_list.append(unpacked.reshape(-1))
+            result = jnp.concat(concat_list, axis=0)
+            unpacked_list.append(result.reshape(1, -1))
+    else:
+        for row_idx in range(src_row_size):
+            unpacked_list.append(vmem_ref[row_idx])
+
+    return jnp.stack(unpacked_list, axis=0)
+
+
+def store_compact_to_large_for_conv_state(
+    vmem_ref: jax.Ref,  # (rows, packing, packed_dim_size)
+    vreg: jax.Array,  # (rows, 1, packing * packed_dim_size)
+) -> None:
+    dst_row_size = vmem_ref.shape[0]
+    src_row_size = vreg.shape[0]
+    assert src_row_size == dst_row_size
+
+    src_dtype = vreg.dtype
+    dst_dtype = vmem_ref.dtype
+    should_pack = src_dtype != dst_dtype
+    src_packing = 4 // src_dtype.itemsize
+    dst_packing = 4 // dst_dtype.itemsize
+
+    assert vreg.ndim == 3
+    assert vreg.shape[-2] == src_packing
+    assert vmem_ref.ndim == 3
+    assert vmem_ref.shape[-2] == dst_packing
+
+    u32_vmem_ref = vmem_ref.bitcast(jnp.uint32)
+    for row_idx in range(dst_row_size):
+        if should_pack:
+            assert src_dtype.itemsize == 4
+            assert dst_dtype.itemsize == 2
+            unpacked_list = jnp.split(vreg[row_idx], dst_packing, axis=-1)
+            packed = pltpu.pack_elementwise(unpacked_list, packed_dtype=dst_dtype)
+            u32_vmem_ref[row_idx] = packed
+        else:
+            vmem_ref[row_idx] = vreg[row_idx]
+
+
+def store_conv_state(
+    conv_state_slot_ref: jax.Ref,
+    carry_conv_scratch_ref: jax.Ref | None,
+    new_conv_state: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    if cfg.conv_state_padded_dim_size > cfg.dim_size:
+        new_conv_state = jnp.pad(
+            new_conv_state,
+            (
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (0, cfg.conv_state_padded_dim_size - cfg.dim_size),
+            ),
+        )
+    new_conv_state = new_conv_state.reshape(
+        -1,
+        new_conv_state.shape[-2],
+        new_conv_state.shape[-1],
+    )
+    conv_state_slot_ref = conv_state_slot_ref.reshape(
+        -1, conv_state_slot_ref.shape[-2], conv_state_slot_ref.shape[-1]
+    )
+    store_compact_to_large_for_conv_state(conv_state_slot_ref, new_conv_state)
+    if carry_conv_scratch_ref is not None:
+        carry_conv_scratch_ref = carry_conv_scratch_ref.reshape(
+            -1, carry_conv_scratch_ref.shape[-2], carry_conv_scratch_ref.shape[-1]
+        )
+        store_compact_to_large_for_conv_state(carry_conv_scratch_ref, new_conv_state)
 
 
 def load_and_select_states(
@@ -182,13 +277,18 @@ def load_and_select_states(
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
         # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
-        hbm_conv_state = conv_state_slot_ref[idx].astype(jnp.float32)
+        hbm_conv_state = load_large_to_compact_for_conv_state(
+                conv_state_slot_ref.at[idx], dst_dtype=jnp.float32
+        ) 
         prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
 
         if carry_conv_scratch_ref is not None:
-            prev_tile_conv = carry_conv_scratch_ref[idx]
+            prev_tile_conv = load_large_to_compact_for_conv_state(
+                   carry_conv_scratch_ref.at[idx], dst_dtype=jnp.float32
+            )
             prev_conv_state = jnp.where(is_first_tile, prev_conv_state,
                                         prev_tile_conv)
+        prev_conv_state = prev_conv_state[..., : cfg.dim_size]
 
         hbm_recurrent_state = recurrent_slot_ref[idx]
         prev_recurrent_state = jnp.where(has_initial_state,
